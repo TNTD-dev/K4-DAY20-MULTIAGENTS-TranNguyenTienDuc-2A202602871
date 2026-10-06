@@ -4,10 +4,35 @@ Pseudo-code: guides/pseudocode/04_curator.md
 Kiểm tra:    pytest tests/test_04_curator.py
 Chạy thật:   python -m lab.curator
 """
+import json
 import re
 from pathlib import Path
 
-from .tasks import eval_markers   # có sẵn: định danh của tác vụ đánh giá, tính lúc chạy
+from .tasks import ROOT, eval_markers   # có sẵn: định danh của tác vụ đánh giá, tính lúc chạy
+
+CURATOR_PROMPT = """You write SKILLS for a coding and data-analysis agent.
+Below are the failed checks (name and the feedback text of the review bot) and the end of the execution trace
+of the agent's runs. Find the general PROCESS mistakes behind them (not task-specific answers) and write at most
+{max_skills} short skills that would help the agent avoid the same mistakes on a NEW task of the same kind.
+
+Rules:
+- A skill must be general: do not mention task ids, file names that belong to one task, answers or numbers.
+- Organisation conventions that the review bot states (required output files, required keys, units, ordering,
+  headers) MAY be written down as rules, in generic wording, because they are the rule itself.
+- Each skill has YAML frontmatter with `name` (lowercase, hyphens) and `description` (ONE sentence that starts with
+  "Use when" and names a broad trigger situation), then at most 40 lines of imperative instructions
+  (a numbered checklist works well), including a short self-check list at the end.
+- Output format, exactly:
+=== SKILL: <name> ===
+---
+name: <name>
+description: <when to use>
+---
+<body>
+=== END ===
+
+{runs}
+"""
 
 # ---- CÓ SẴN, KHÔNG SỬA: kiểm tra và tách khối skill (phần dễ sai và liên quan bảo mật) ----------------
 SAFE_NAME = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
@@ -68,7 +93,52 @@ def curate_skills(results_dir="results", source_condition="baseline", out_dir=No
     model mặc định: make_model() (lab.model).
     Trả về: danh sách đường dẫn SKILL.md đã ghi.
     """
-    raise NotImplementedError("TODO: cài đặt curate_skills (xem guides/pseudocode/04_curator.md)")
+    out_dir = Path(out_dir) if out_dir is not None else ROOT / "skills" / "auto"
+    base = Path(results_dir) / source_condition
+
+    runs = []
+    for run_file in sorted(base.glob("*/run.json")):
+        r = json.loads(run_file.read_text(encoding="utf-8"))
+        if r.get("role") != "learn":      # never use evaluation-task data
+            continue
+        trace_file = run_file.parent / "trace.md"
+        trace = trace_file.read_text(encoding="utf-8")[-6000:] if trace_file.exists() else ""
+        failed = [(c["name"], c.get("detail", "")) for c in r.get("checks", []) if not c.get("passed")]
+        runs.append({"task": r.get("task", run_file.parent.name), "failed": failed, "trace": trace})
+
+    if not any(r["failed"] for r in runs):
+        print("WARNING: no failed checks in the learning tasks; nothing to learn from.")
+        return []
+
+    sections = []
+    for r in runs:
+        if not r["failed"]:
+            continue
+        failed_txt = "\n".join(f"- check `{n}`: {d}" for n, d in r["failed"])
+        sections.append(f"## Run: {r['task']}\nFailed checks and review-bot feedback:\n{failed_txt}\n\n"
+                        f"End of the execution trace:\n{r['trace']}")
+    prompt = CURATOR_PROMPT.format(max_skills=max_skills, runs="\n\n".join(sections))
+
+    if model is None:
+        from .model import make_model
+        model = make_model()
+    reply = model.invoke(prompt).content
+    if not isinstance(reply, str):
+        reply = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in reply)
+
+    written = []
+    for name, text in parse_skill_blocks(reply):
+        if len(written) >= max_skills:
+            break
+        problems = validate_skill(text, expected_name=name)
+        if problems:
+            print(f"skipped skill {name!r}: {'; '.join(problems)}")
+            continue
+        target = out_dir / name / "SKILL.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text + "\n", encoding="utf-8")
+        written.append(target)
+    return written
 
 
 if __name__ == "__main__":
